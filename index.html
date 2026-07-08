@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MQ会計 × 個人財務諸表 ── 売上から手取りまで、お金の流れを見える化する</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@600;800&family=Zen+Kaku+Gothic+New:wght@400;500;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>body{margin:0;-webkit-text-size-adjust:100%;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="env,react">
+const { useState, useMemo, useEffect } = React;
+
+// ============================================================
+// 定数：令和8年度（2026年度）適用料率・税制
+// 前提：東京都・協会けんぽ・一般の事業・単身（扶養なし）・賞与なし
+// ============================================================
+const RATES = {
+  health: 0.0985, care: 0.0162, support: 0.0023, pension: 0.183,
+  empWorker: 0.005, empEmployer: 0.0085, rousai: 0.003, kodomo: 0.0036,
+};
+const HG = [58,63,68,78,88,98,104,110,118,126,134,142,150,160,170,180,190,200,220,240,260,280,300,320,340,360,380,410,440,470,500,530,560,590,620,650,680,710,750,790,830,880,930,980,1030,1090,1150,1210,1270,1330,1390].map(x => x * 1000);
+const PG = HG.filter(x => x >= 88000 && x <= 650000);
+
+function smr(pay, grades) {
+  let s = grades[0];
+  for (let i = 1; i < grades.length; i++) if (pay >= (grades[i-1] + grades[i]) / 2) s = grades[i];
+  return s;
+}
+function salaryDeduction(z) {
+  if (z <= 1900000) return Math.min(z, 740000);
+  if (z <= 3600000) return z * 0.3 + 80000;
+  if (z <= 6600000) return z * 0.2 + 440000;
+  if (z <= 8500000) return z * 0.1 + 1100000;
+  return 1950000;
+}
+function basicDeduction(income) {
+  if (income <= 4890000) return 1040000;
+  if (income <= 6550000) return 670000;
+  if (income <= 23500000) return 620000;
+  if (income <= 24000000) return 480000;
+  if (income <= 24500000) return 320000;
+  if (income <= 25000000) return 160000;
+  return 0;
+}
+function incomeTax(taxable) {
+  const t = Math.floor(Math.max(0, taxable) / 1000) * 1000;
+  let tax = 0;
+  if (t <= 1950000) tax = t * 0.05;
+  else if (t <= 3300000) tax = t * 0.1 - 97500;
+  else if (t <= 6950000) tax = t * 0.2 - 427500;
+  else if (t <= 9000000) tax = t * 0.23 - 636000;
+  else if (t <= 18000000) tax = t * 0.33 - 1536000;
+  else if (t <= 40000000) tax = t * 0.4 - 2796000;
+  else tax = t * 0.45 - 4796000;
+  return Math.floor((tax * 1.021) / 100) * 100;
+}
+function payroll(gross, isCare) {
+  const sh = smr(gross, HG), sp = smr(gross, PG);
+  const w = {
+    health: Math.round((sh * RATES.health) / 2),
+    care: isCare ? Math.round((sh * RATES.care) / 2) : 0,
+    support: Math.round((sh * RATES.support) / 2),
+    pension: Math.round((sp * RATES.pension) / 2),
+    emp: Math.round(gross * RATES.empWorker),
+  };
+  const wSocial = w.health + w.care + w.support + w.pension + w.emp;
+  const e = {
+    health: Math.round((sh * RATES.health) / 2),
+    care: isCare ? Math.round((sh * RATES.care) / 2) : 0,
+    support: Math.round((sh * RATES.support) / 2),
+    pension: Math.round((sp * RATES.pension) / 2),
+    emp: Math.round(gross * RATES.empEmployer),
+    rousai: Math.round(gross * RATES.rousai),
+    kodomo: Math.round(sp * RATES.kodomo),
+  };
+  const eSocial = e.health + e.care + e.support + e.pension + e.emp + e.rousai + e.kodomo;
+  const annual = gross * 12;
+  const salaryIncome = Math.max(0, annual - salaryDeduction(annual));
+  const socialAnnual = wSocial * 12;
+  const taxableNational = Math.max(0, salaryIncome - socialAnnual - basicDeduction(salaryIncome));
+  const itaxAnnual = incomeTax(taxableNational);
+  let rtaxAnnual = 0;
+  if (salaryIncome > 450000) {
+    const taxableLocal = Math.max(0, salaryIncome - socialAnnual - 430000);
+    const shotokuwari = Math.max(0, Math.floor(taxableLocal * 0.1) - (taxableLocal > 0 ? 2500 : 0));
+    rtaxAnnual = shotokuwari + 5000;
+  }
+  const itax = Math.round(itaxAnnual / 12), rtax = Math.round(rtaxAnnual / 12);
+  const net = gross - wSocial - itax - rtax;
+  return { gross, sh, sp, w, wSocial, e, eSocial, itax, rtax, net, employerCost: gross + eSocial };
+}
+function solveGross(targetNet, isCare) {
+  let lo = targetNet, hi = targetNet * 2.5 + 300000;
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2;
+    if (payroll(mid, isCare).net < targetNet) lo = mid; else hi = mid;
+  }
+  return Math.round(hi / 1000) * 1000;
+}
+// 法人税等（中小法人・資本金1億円以下・東京都、初年度・概算）
+function corporateTax(pretax) {
+  if (pretax <= 0) return { houjin: 0, chihou: 0, juumin: 70000, jigyou: 0, total: 70000 };
+  const t = Math.floor(pretax / 1000) * 1000;
+  const houjin = Math.round(Math.min(t, 8000000) * 0.15 + Math.max(0, t - 8000000) * 0.232);
+  const chihou = Math.round(houjin * 0.103);
+  const juumin = Math.round(houjin * 0.07) + 70000;
+  let jg = 0;
+  jg += Math.min(t, 4000000) * 0.035;
+  jg += Math.max(0, Math.min(t, 8000000) - 4000000) * 0.053;
+  jg += Math.max(0, t - 8000000) * 0.07;
+  const jigyou = Math.round(jg + jg * 0.37);
+  return { houjin, chihou, juumin, jigyou, total: houjin + chihou + juumin + jigyou };
+}
+
+// ---- helpers ----
+const yen = (n) => "¥" + Math.round(n).toLocaleString("ja-JP");
+const man = (n) => (n / 10000).toLocaleString("ja-JP", { maximumFractionDigits: 1 }) + "万円";
+const num = (n) => Math.round(n).toLocaleString("ja-JP");
+const acc = (n) => (n < 0 ? "△" + num(-n) : num(n));
+
+const FONT_CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@600;800&family=Zen+Kaku+Gothic+New:wght@400;500;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
+`;
+const C = {
+  paper: "#F5F6F4", ink: "#17324F", inkSoft: "#4A617A", line: "#C9D2D8",
+  shu: "#C0392B", mq: "#2E6E8E", vq: "#9DB3BF", f: "#D9A441", gPlus: "#17324F",
+  water: "#3D7EA6", waterDeep: "#1F5A7A", net: "#1C7C54",
+};
+
+function Field({ label, sub, value, onChange, min, max, step, unit }) {
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <div>
+          <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, color: C.ink, fontSize: 14 }}>{label}</span>
+          <span style={{ marginLeft: 8, fontSize: 12, color: C.inkSoft }}>{sub}</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <input type="text" inputMode="decimal" value={Number(value).toLocaleString("ja-JP", { maximumFractionDigits: 2 })}
+            onChange={(e) => { const n = parseFloat(e.target.value.replace(/[^0-9.]/g, "")); onChange(isNaN(n) ? 0 : n); }}
+            style={{ width: 110, textAlign: "right", fontFamily: "'IBM Plex Mono', monospace", fontSize: 15, fontWeight: 600, color: C.ink, background: "#fff", border: `1px solid ${C.line}`, borderRadius: 6, padding: "4px 6px" }} />
+          <span style={{ fontSize: 12, color: C.inkSoft, width: 30 }}>{unit}</span>
+        </div>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={Math.min(value, max)} onChange={(e) => onChange(Number(e.target.value))}
+        style={{ width: "100%", accentColor: C.ink, marginTop: 6 }} />
+    </div>
+  );
+}
+function Card({ title, sub, children, accent }) {
+  return (
+    <div style={{ background: "#fff", border: `${accent ? 1.5 : 1}px solid ${accent ? C.ink : C.line}`, borderRadius: 12, padding: 16, marginBottom: 22 }}>
+      {title && <div style={{ fontFamily: "'Shippori Mincho', serif", fontWeight: 600, fontSize: 15, marginBottom: sub ? 4 : 10 }}>{title}</div>}
+      {sub && <div style={{ fontSize: 12, color: C.inkSoft, marginBottom: 12 }}>{sub}</div>}
+      {children}
+    </div>
+  );
+}
+// 決算書の1行（税理士様式：右寄せ・△表記）
+function FRow({ label, val, lv = 0, bold, rule, total }) {
+  return (
+    <div style={{
+      display: "flex", justifyContent: "space-between", alignItems: "baseline",
+      padding: "5px 0", paddingLeft: lv * 14,
+      borderTop: rule ? `1px solid ${C.ink}` : "none",
+      borderBottom: total ? `3px double ${C.ink}` : `1px dotted ${C.line}`,
+      fontWeight: bold ? 700 : 400,
+    }}>
+      <span style={{ fontSize: 12.5 }}>{label}</span>
+      <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, fontWeight: bold ? 700 : 500, color: val < 0 ? C.shu : C.ink }}>{acc(val)}</span>
+    </div>
+  );
+}
+function Strac({ PQ, VQ, F }) {
+  const MQ = PQ - VQ, G = MQ - F;
+  const W = 340, H = 300, pad = 8, top = 26;
+  const base = Math.max(PQ, VQ + Math.max(MQ, 0), F + Math.max(G, 0), F, 1);
+  const s = (H - top - pad) / base;
+  const colW = 92, gap = 24;
+  const x1 = pad, x2 = x1 + colW + gap, x3 = x2 + colW + gap;
+  const floor = H - pad;
+  const Box = ({ x, h, y, fill, label, val, dash, textFill = "#fff" }) => (
+    <g>
+      <rect x={x} y={y} width={colW} height={Math.max(h, 2)} fill={fill} rx={3}
+        stroke={dash ? C.shu : "none"} strokeDasharray={dash ? "5 4" : "0"} strokeWidth={dash ? 2 : 0} />
+      {h > 30 ? (
+        <>
+          <text x={x + colW / 2} y={y + h / 2 - 4} textAnchor="middle" fill={textFill} fontSize="13" fontWeight="700" fontFamily="'Zen Kaku Gothic New', sans-serif">{label}</text>
+          <text x={x + colW / 2} y={y + h / 2 + 13} textAnchor="middle" fill={textFill} fontSize="11" fontFamily="'IBM Plex Mono', monospace">{yen(val)}</text>
+        </>
+      ) : (
+        <text x={x + colW / 2} y={y - 4} textAnchor="middle" fill={C.ink} fontSize="11" fontWeight="700" fontFamily="'Zen Kaku Gothic New', sans-serif">{label} {yen(val)}</text>
+      )}
+    </g>
+  );
+  const hPQ = PQ * s, hVQ = VQ * s, hMQ = Math.max(MQ, 0) * s, hF = F * s;
+  const gAbs = Math.abs(G) * s;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto" }}>
+      <Box x={x1} y={floor - hPQ} h={hPQ} fill={C.ink} label="売上 PQ" val={PQ} />
+      <Box x={x2} y={floor - hVQ} h={hVQ} fill={C.vq} label="変動費 VQ" val={VQ} textFill={C.ink} />
+      <Box x={x2} y={floor - hVQ - hMQ} h={hMQ} fill={C.mq} label="粗利 MQ" val={PQ - VQ} />
+      <Box x={x3} y={floor - hVQ - hF} h={hF} fill={C.f} label="固定費 F" val={F} textFill={C.ink} />
+      {G >= 0 ? (
+        <Box x={x3} y={floor - hVQ - hF - gAbs} h={gAbs} fill={C.gPlus} label="利益 G" val={G} />
+      ) : (
+        <Box x={x3} y={floor - hVQ - hF} h={gAbs} fill="#F8E5E2" label="損失 G" val={G} dash textFill={C.shu} />
+      )}
+      <line x1={pad} y1={floor} x2={W - pad} y2={floor} stroke={C.ink} strokeWidth="1.5" />
+    </svg>
+  );
+}
+function Flow({ rows, total }) {
+  return (
+    <div>
+      {rows.map((r, i) => (
+        <div key={i} style={{ marginBottom: 8 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
+            <span style={{ color: r.deduct ? C.shu : C.ink, fontWeight: r.big ? 700 : 500 }}>{r.deduct ? "▼ " : ""}{r.label}</span>
+            <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, color: r.deduct ? C.shu : C.ink }}>{r.deduct ? "−" : ""}{yen(r.val)}</span>
+          </div>
+          <div style={{ height: r.big ? 22 : 12, background: C.paper, borderRadius: 4 }}>
+            <div style={{ height: "100%", borderRadius: 4, transition: "width .35s", width: `${Math.max(0.5, (r.remain / total) * 100)}%`, background: r.color || (r.deduct ? C.water : C.waterDeep), opacity: r.deduct ? 0.9 : 1 }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function MQVisualizer() {
+  const [tab, setTab] = useState("mq");
+  // ---- 事業側 ----
+  const [idea, setIdea] = useState("キッチンカーのスペシャルティコーヒー");
+  const [P, setP] = useState(600);
+  const [V, setV] = useState(180);
+  const [Q, setQ] = useState(800);
+  const [salary, setSalary] = useState(300000);   // 役員報酬（額面月額）
+  const [otherF, setOtherF] = useState(150000);   // その他固定費（月）
+  const [isCare, setIsCare] = useState(false);
+  // ---- 財務前提 ----
+  const [capex, setCapex] = useState(1500000);    // 設備投資
+  const [depYears, setDepYears] = useState(5);    // 耐用年数
+  const [capital, setCapital] = useState(1000000);// 資本金
+  const [loan, setLoan] = useState(2000000);      // 借入金
+  const [rate, setRate] = useState(2.5);          // 借入利率%
+  const [loanYears, setLoanYears] = useState(5);  // 返済年数
+  const [arM, setArM] = useState(0);              // 売掛回収サイト（月）
+  const [apM, setApM] = useState(1);              // 買掛支払サイト（月）
+  const [invM, setInvM] = useState(0.5);          // 在庫（月分）
+  // ---- AI ----
+  const [aiNotes, setAiNotes] = useState(null);
+  // ---- 給与側 ----
+  const [targetNet, setTargetNet] = useState(300000);
+  const [otherF2, setOtherF2] = useState(200000);
+  const [targetG, setTargetG] = useState(100000);
+  const [mRatePct, setMRatePct] = useState(70);
+
+  useEffect(() => {
+    const el = document.createElement("style");
+    el.textContent = FONT_CSS;
+    document.head.appendChild(el);
+    return () => el.remove();
+  }, []);
+
+  // ---- 事業計算：MQ → 三表 ----
+  const d = useMemo(() => {
+    const pr = payroll(salary, isCare);
+    const depM = depYears > 0 ? capex / (depYears * 12) : 0;
+    const F = salary + pr.eSocial + otherF + depM; // 月次固定費（法定福利費・減価償却込み）
+    const M = P - V, PQ = P * Q, VQ = V * Q, MQ = M * Q, G = MQ - F;
+    const beQ = M > 0 ? Math.ceil(F / M) : null;
+    const mRate = PQ > 0 ? MQ / PQ : 0;
+    const sens = [
+      { key: "P", name: "P を1%上げる（値決め）", dG: 0.01 * P * Q },
+      { key: "V", name: "V を1%下げる（原価改善）", dG: 0.01 * V * Q },
+      { key: "Q", name: "Q を1%増やす（販売数）", dG: 0.01 * M * Q },
+      { key: "F", name: "F を1%削る（固定費）", dG: 0.01 * F },
+    ].sort((a, b) => b.dG - a.dG);
+
+    // ===== PL（年次・初年度）=====
+    const sales = PQ * 12, cogs = VQ * 12, gross = MQ * 12;
+    const sga = { salary: salary * 12, welfare: pr.eSocial * 12, other: otherF * 12, dep: depM * 12 };
+    const sgaTotal = sga.salary + sga.welfare + sga.other + sga.dep;
+    const opProfit = gross - sgaTotal;
+    const interest = loan * (rate / 100); // 初年度利息（概算・期首残高ベース）
+    const ordinary = opProfit - interest;
+    const pretax = ordinary;
+    const ct = corporateTax(pretax);
+    const netIncome = pretax - ct.total;
+
+    // ===== BS（第1期末）=====
+    const ar = PQ * arM;             // 売掛金
+    const inv = VQ * invM;           // 棚卸資産
+    const fa = Math.max(0, capex - sga.dep); // 固定資産（簿価）
+    const ap = VQ * apM;             // 買掛金
+    const repay = loanYears > 0 ? loan / loanYears : 0; // 元金返済（年）
+    const loanEnd = Math.max(0, loan - repay);
+    // ===== CS（間接法・第1期）=====
+    const cfo = pretax + sga.dep - ar - inv + ap; // 法人税等は期末未払（支払は翌期）
+    const cfi = -capex;
+    const cff = capital + loan - repay;
+    const cash = cfo + cfi + cff;
+    const assets = cash + ar + inv + fa;
+    const liabEq = ap + loanEnd + ct.total + capital + netIncome;
+
+    return { pr, depM, F, M, PQ, VQ, MQ, G, beQ, mRate, sens,
+      pl: { sales, cogs, gross, sga, sgaTotal, opProfit, interest, ordinary, pretax, ct, netIncome },
+      bs: { cash, ar, inv, fa, assets, ap, loanEnd, taxPayable: ct.total, capital, retained: netIncome, liabEq },
+      cs: { cfo, cfi, cff, cash, detail: { pretax, dep: sga.dep, ar: -ar, inv: -inv, ap } } };
+  }, [P, V, Q, salary, otherF, isCare, capex, depYears, capital, loan, rate, loanYears, arM, apM, invM]);
+
+  // ---- 給与逆算 ----
+  const s = useMemo(() => {
+    const gross = solveGross(targetNet, isCare);
+    const pr = payroll(gross, isCare);
+    const laborCost = pr.employerCost;
+    const mr = Math.max(0.05, mRatePct / 100);
+    const needMQ = laborCost + otherF2 + targetG;
+    const needPQ = needMQ / mr;
+    return { gross, pr, laborCost, needMQ, needPQ, needVQ: needPQ - needMQ, xGross: needPQ / gross, xNet: needPQ / pr.net };
+  }, [targetNet, isCare, otherF2, targetG, mRatePct]);
+
+  const black = d.G >= 0;
+  const maxdG = Math.max(...d.sens.map((x) => x.dG), 1);
+  const tabStyle = (on) => ({
+    flex: 1, padding: "12px 4px", textAlign: "center", fontSize: 13, fontWeight: 700, cursor: "pointer",
+    fontFamily: "'Zen Kaku Gothic New', sans-serif", lineHeight: 1.4,
+    color: on ? "#fff" : C.ink, background: on ? C.ink : "#fff",
+    border: `1.5px solid ${C.ink}`, borderRadius: 8,
+  });
+  const sheetHead = (t, sub) => (
+    <div style={{ textAlign: "center", marginBottom: 10 }}>
+      <div style={{ fontFamily: "'Shippori Mincho', serif", fontWeight: 800, fontSize: 17, letterSpacing: "0.15em" }}>{t}</div>
+      <div style={{ fontSize: 11, color: C.inkSoft }}>{sub}　（単位：円）</div>
+    </div>
+  );
+
+  const flowRows = [
+    { label: "会社の売上（月）", val: s.needPQ, remain: s.needPQ, big: true, color: C.ink },
+    { label: "変動費（原価など）", val: s.needVQ, remain: s.needPQ - s.needVQ, deduct: true, color: C.vq },
+    { label: "粗利 MQ", val: s.needMQ, remain: s.needMQ, big: true, color: C.mq },
+    { label: "その他固定費＋目標利益", val: otherF2 + targetG, remain: s.needMQ - otherF2 - targetG, deduct: true, color: C.f },
+    { label: "会社負担の社会保険料等", val: s.pr.eSocial, remain: s.gross, deduct: true, color: C.water },
+    { label: "額面給与（給与明細の支給額）", val: s.gross, remain: s.gross, big: true, color: C.waterDeep },
+    { label: "社会保険料（本人負担）", val: s.pr.wSocial, remain: s.gross - s.pr.wSocial, deduct: true },
+    { label: "所得税（復興特別所得税込・月割）", val: s.pr.itax, remain: s.gross - s.pr.wSocial - s.pr.itax, deduct: true },
+    { label: "住民税（均等割・森林環境税込・月割）", val: s.pr.rtax, remain: s.pr.net, deduct: true },
+    { label: "手取り", val: s.pr.net, remain: s.pr.net, big: true, color: C.net },
+  ];
+  const detail = [
+    ["健康保険（9.85%折半）", s.pr.w.health, s.pr.e.health],
+    ["介護保険（1.62%折半・40〜64歳）", s.pr.w.care, s.pr.e.care],
+    ["子ども・子育て支援金（0.23%折半）", s.pr.w.support, s.pr.e.support],
+    ["厚生年金（18.3%折半）", s.pr.w.pension, s.pr.e.pension],
+    ["雇用保険（本人0.5%／会社0.85%）", s.pr.w.emp, s.pr.e.emp],
+    ["労災保険（0.3%・全額会社）", 0, s.pr.e.rousai],
+    ["子ども・子育て拠出金（0.36%・全額会社）", 0, s.pr.e.kodomo],
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.paper, fontFamily: "'Zen Kaku Gothic New', sans-serif", color: C.ink }}>
+      <div style={{ maxWidth: 560, margin: "0 auto", padding: "28px 18px 60px" }}>
+
+        {/* 上部の一文 */}
+        <div style={{ borderBottom: `2px solid ${C.ink}`, paddingBottom: 14, marginBottom: 18 }}>
+          <h1 style={{ fontFamily: "'Shippori Mincho', serif", fontWeight: 800, fontSize: 22, margin: 0, lineHeight: 1.4 }}>
+            売上から手取りまで、お金の流れを見える化する
+          </h1>
+        </div>
+
+        {/* 2つのタブ */}
+        <div style={{ display: "flex", gap: 8, marginBottom: 22 }}>
+          <div style={tabStyle(tab === "mq")} onClick={() => setTab("mq")}>① MQ会計 × 財務諸表</div>
+          <div style={tabStyle(tab === "salary")} onClick={() => setTab("salary")}>② 給与（手取り逆算）</div>
+        </div>
+
+        {tab === "mq" && (
+          <>
+                        <label style={{ fontSize: 12, color: C.inkSoft }}>アイディア名</label>
+            <input value={idea} onChange={(e) => setIdea(e.target.value)}
+              style={{ width: "100%", boxSizing: "border-box", fontFamily: "'Shippori Mincho', serif", fontWeight: 600, fontSize: 17, color: C.ink, background: "#fff", border: `1px solid ${C.line}`, borderRadius: 8, padding: "10px 12px", margin: "4px 0 20px" }} />
+
+            <Card title="P・V・Q・F">
+              <Field label="P" sub="1個の売価" value={P} onChange={setP} min={0} max={100000000} step={100} unit="円" />
+              <Field label="V" sub="1個の変動費（材料など）" value={V} onChange={setV} min={0} max={100000000} step={100} unit="円" />
+              <Field label="Q" sub="月に売れる数" value={Q} onChange={setQ} min={0} max={100000000} step={100} unit="個" />
+              <Field label="F₁" sub="役員報酬（あなたの額面月給）" value={salary} onChange={setSalary} min={0} max={100000000} step={10000} unit="円" />
+              <Field label="F₂" sub="その他固定費（家賃・光熱費等／月）" value={otherF} onChange={setOtherF} min={0} max={100000000} step={10000} unit="円" />
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginBottom: 10 }}>
+                <input type="checkbox" checked={isCare} onChange={(e) => setIsCare(e.target.checked)} style={{ accentColor: C.ink, width: 16, height: 16 }} />
+                40〜64歳（介護保険料あり）
+              </label>
+              <div style={{ borderTop: `1px dashed ${C.line}`, paddingTop: 10, fontSize: 12.5, color: C.inkSoft, lineHeight: 1.9 }}>
+                法定福利費（会社負担・自動計算）：<b style={{ color: C.ink }}>{yen(d.pr.eSocial)}</b>／月<br />
+                減価償却費（月割）：<b style={{ color: C.ink }}>{yen(d.depM)}</b><br />
+                固定費F合計 = F₁＋法定福利費＋F₂＋減価償却 = <b style={{ color: C.ink, fontFamily: "'IBM Plex Mono', monospace" }}>{yen(d.F)}</b><br />
+                M（1個あたり粗利）= <b style={{ color: C.ink }}>{yen(d.M)}</b>　粗利率 = <b style={{ color: C.ink }}>{(d.mRate * 100).toFixed(1)}%</b>
+              </div>
+              {aiNotes && (
+                <div style={{ borderTop: `1px dashed ${C.line}`, marginTop: 10, paddingTop: 10 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>AIの仮説根拠（スライダーで自由に補正してください）</div>
+                  {aiNotes.map((n, i) => (
+                    <div key={i} style={{ fontSize: 12, color: C.inkSoft, lineHeight: 1.7 }}>
+                      <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, color: C.ink }}>{["P", "V", "Q", "F₁", "F₂", "設備"][i]}</span>　{n}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Card>
+
+            <Card title="財務前提（BS・CSの材料）" sub="開業資金と商売のリズム。三表はここから組み上がります。">
+              <Field label="設備" sub="開業時の設備投資" value={capex} onChange={setCapex} min={0} max={20000000} step={100000} unit="円" />
+              <Field label="耐用" sub="減価償却の耐用年数（定額法）" value={depYears} onChange={setDepYears} min={2} max={20} step={1} unit="年" />
+              <Field label="資本" sub="資本金（自己資金）" value={capital} onChange={setCapital} min={0} max={20000000} step={100000} unit="円" />
+              <Field label="借入" sub="借入金（創業融資など）" value={loan} onChange={setLoan} min={0} max={30000000} step={100000} unit="円" />
+              <Field label="利率" sub="借入利率（年）" value={rate} onChange={setRate} min={0} max={10} step={0.1} unit="％" />
+              <Field label="返済" sub="返済年数（元金均等）" value={loanYears} onChange={setLoanYears} min={1} max={20} step={1} unit="年" />
+              <Field label="回収" sub="売上の回収サイト（0=現金商売）" value={arM} onChange={setArM} min={0} max={3} step={0.5} unit="ヶ月" />
+              <Field label="支払" sub="仕入の支払サイト" value={apM} onChange={setApM} min={0} max={3} step={0.5} unit="ヶ月" />
+              <Field label="在庫" sub="抱える在庫量（月商の変動費換算）" value={invM} onChange={setInvM} min={0} max={3} step={0.5} unit="ヶ月" />
+            </Card>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 10 }}>
+              <div style={{ width: 74, height: 74, borderRadius: "50%", flexShrink: 0, border: `3px solid ${black ? C.ink : C.shu}`, color: black ? C.ink : C.shu, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Shippori Mincho', serif", fontWeight: 800, fontSize: 22, transform: "rotate(-8deg)", background: "#fff" }}>
+                {black ? "黒字" : "赤字"}
+              </div>
+              <div>
+                <div style={{ fontSize: 12, color: C.inkSoft }}>月次営業利益 G = MQ − F</div>
+                <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, fontSize: 26, color: black ? C.ink : C.shu }}>{yen(d.G)}</div>
+                {d.beQ !== null ? (
+                  <div style={{ fontSize: 13, color: C.inkSoft }}>損益分岐点：月 <b style={{ color: C.ink }}>{num(d.beQ)}個</b>（1日約{num(d.beQ / 30)}個）</div>
+                ) : (
+                  <div style={{ fontSize: 13, color: C.shu }}>M ≤ 0：売るほど損する構造です</div>
+                )}
+              </div>
+            </div>
+
+            <Card title={`STRAC表 ── 「${idea}」の骨格（月次）`}>
+              <Strac PQ={d.PQ} VQ={d.VQ} F={d.F} />
+            </Card>
+
+            <Card title="利益のセンターピン" sub="各要素を1%だけ改善したとき、Gはいくら増えるか。">
+              {d.sens.map((x, i) => (
+                <div key={x.key} style={{ marginBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 4 }}>
+                    <span>{x.name}{i === 0 && <span style={{ marginLeft: 8, fontSize: 11, color: "#fff", background: C.shu, borderRadius: 4, padding: "2px 6px", fontWeight: 700 }}>センターピン</span>}</span>
+                    <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600 }}>+{yen(x.dG)}</span>
+                  </div>
+                  <div style={{ height: 10, background: C.paper, borderRadius: 5 }}>
+                    <div style={{ height: 10, width: `${(x.dG / maxdG) * 100}%`, background: i === 0 ? C.shu : C.mq, borderRadius: 5, transition: "width .3s" }} />
+                  </div>
+                </div>
+              ))}
+            </Card>
+
+            {/* ============ 財務三表 ============ */}
+            <div style={{ fontFamily: "'Shippori Mincho', serif", fontWeight: 800, fontSize: 19, margin: "26px 0 4px", borderLeft: `4px solid ${C.ink}`, paddingLeft: 10 }}>財務三表（第1期・年次）</div>
+            <div style={{ fontSize: 12, color: C.inkSoft, marginBottom: 14 }}>アイディアが、決算書になりました。</div>
+
+            <Card>
+              {sheetHead("損益計算書", `自 第1期期首　至 第1期期末`)}
+              <FRow label="売上高" val={d.pl.sales} bold />
+              <FRow label="売上原価（変動費）" val={d.pl.cogs} lv={1} />
+              <FRow label="売上総利益（粗利MQ）" val={d.pl.gross} bold rule />
+              <FRow label="販売費及び一般管理費" val={d.pl.sgaTotal} lv={0} />
+              <FRow label="役員報酬" val={d.pl.sga.salary} lv={1} />
+              <FRow label="法定福利費" val={d.pl.sga.welfare} lv={1} />
+              <FRow label="減価償却費" val={d.pl.sga.dep} lv={1} />
+              <FRow label="その他販管費" val={d.pl.sga.other} lv={1} />
+              <FRow label="営業利益" val={d.pl.opProfit} bold rule />
+              <FRow label="支払利息（営業外費用）" val={d.pl.interest} lv={1} />
+              <FRow label="経常利益" val={d.pl.ordinary} bold rule />
+              <FRow label="税引前当期純利益" val={d.pl.pretax} bold />
+              <FRow label="法人税、住民税及び事業税" val={d.pl.ct.total} lv={1} />
+              <FRow label="当期純利益" val={d.pl.netIncome} bold total />
+              <div style={{ fontSize: 11, color: C.inkSoft, marginTop: 8, lineHeight: 1.7 }}>
+                法人税等の内訳（中小法人・東京都・概算）：法人税 {num(d.pl.ct.houjin)}／地方法人税 {num(d.pl.ct.chihou)}／法人住民税 {num(d.pl.ct.juumin)}（均等割7万円含む）／事業税等 {num(d.pl.ct.jigyou)}
+              </div>
+            </Card>
+
+            <Card>
+              {sheetHead("貸借対照表", "第1期末現在")}
+              <div style={{ display: "flex", gap: 12 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, borderBottom: `2px solid ${C.ink}`, paddingBottom: 4, marginBottom: 2 }}>資産の部</div>
+                  <FRow label="現金及び預金" val={d.bs.cash} />
+                  <FRow label="売掛金" val={d.bs.ar} />
+                  <FRow label="棚卸資産" val={d.bs.inv} />
+                  <FRow label="固定資産（簿価）" val={d.bs.fa} />
+                  <FRow label="資産合計" val={d.bs.assets} bold total />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, borderBottom: `2px solid ${C.ink}`, paddingBottom: 4, marginBottom: 2 }}>負債・純資産の部</div>
+                  <FRow label="買掛金" val={d.bs.ap} />
+                  <FRow label="未払法人税等" val={d.bs.taxPayable} />
+                  <FRow label="長期借入金" val={d.bs.loanEnd} />
+                  <FRow label="資本金" val={d.bs.capital} />
+                  <FRow label="利益剰余金" val={d.bs.retained} />
+                  <FRow label="負債・純資産合計" val={d.bs.liabEq} bold total />
+                </div>
+              </div>
+              <div style={{ fontSize: 11, color: Math.abs(d.bs.assets - d.bs.liabEq) < 2 ? C.inkSoft : C.shu, marginTop: 8 }}>
+                {Math.abs(d.bs.assets - d.bs.liabEq) < 2 ? "✓ 貸借一致（バランス）しています" : "貸借不一致"}
+              </div>
+            </Card>
+
+            <Card>
+              {sheetHead("キャッシュ・フロー計算書", "第1期（間接法）")}
+              <FRow label="営業活動によるCF" val={d.cs.cfo} bold />
+              <FRow label="税引前当期純利益" val={d.cs.detail.pretax} lv={1} />
+              <FRow label="減価償却費" val={d.cs.detail.dep} lv={1} />
+              <FRow label="売上債権の増加" val={d.cs.detail.ar} lv={1} />
+              <FRow label="棚卸資産の増加" val={d.cs.detail.inv} lv={1} />
+              <FRow label="仕入債務の増加" val={d.cs.detail.ap} lv={1} />
+              <FRow label="投資活動によるCF（設備投資）" val={d.cs.cfi} bold />
+              <FRow label="財務活動によるCF（出資＋借入−返済）" val={d.cs.cff} bold />
+              <FRow label="現金及び現金同等物の期末残高" val={d.cs.cash} bold total />
+              {d.cs.cash < 0 && (
+                <div style={{ marginTop: 10, padding: "10px 12px", background: "#F8E5E2", border: `1.5px solid ${C.shu}`, borderRadius: 8, fontSize: 13, color: C.shu, fontWeight: 700 }}>
+                  ⚠ 資金ショート：PLが黒字でも現金が尽きます（勘定合って銭足らず）。資本金・借入を{yen(-d.cs.cash)}以上厚くするか、回収サイトの短縮が必要です。
+                </div>
+              )}
+            </Card>
+
+            <button onClick={() => { setMRatePct(Math.round(d.mRate * 100)); setTargetNet(Math.round(d.pr.net / 10000) * 10000); setOtherF2(otherF + Math.round(d.depM)); setTab("salary"); }}
+              style={{ width: "100%", padding: 13, background: C.ink, color: "#fff", border: "none", borderRadius: 8, fontWeight: 700, fontSize: 14, cursor: "pointer", fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>
+              この役員報酬（手取り約{man(d.pr.net)}）と粗利率{(d.mRate * 100).toFixed(0)}%を ②に引き継ぐ →
+            </button>
+            <p style={{ fontSize: 11, color: C.inkSoft, marginTop: 14, lineHeight: 1.8 }}>
+              【三表の前提】初年度・月次一定・賞与なし。法人税等は中小法人（資本金1億円以下・東京都）の概算で、事業税の翌期損金算入は簡略化。支払利息は期首残高ベースの概算。実際の決算・申告は税理士にご相談ください。
+            </p>
+          </>
+        )}
+
+        {tab === "salary" && (
+          <>
+            <Card accent title="欲しい手取りから、必要な売上を逆算する。">
+              <Field label="手取" sub="欲しい手取り月額" value={targetNet} onChange={setTargetNet} min={150000} max={30000000} step={10000} unit="円" />
+              <Field label="粗利" sub="粗利率" value={mRatePct} onChange={setMRatePct} min={10} max={100} step={1} unit="％" />
+              <Field label="固定" sub="あなたの給与以外の固定費（月）" value={otherF2} onChange={setOtherF2} min={0} max={2000000} step={10000} unit="円" />
+              <Field label="利益" sub="会社に残したい利益G（月）" value={targetG} onChange={setTargetG} min={0} max={30000000} step={10000} unit="円" />
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginTop: 4 }}>
+                <input type="checkbox" checked={isCare} onChange={(e) => setIsCare(e.target.checked)} style={{ accentColor: C.ink, width: 16, height: 16 }} />
+                40〜64歳（介護保険料あり）
+              </label>
+            </Card>
+
+            <div style={{ textAlign: "center", marginBottom: 22, background: "#fff", border: `2px solid ${C.ink}`, borderRadius: 12, padding: "18px 12px" }}>
+              <div style={{ fontSize: 13, color: C.inkSoft }}>手取り{man(targetNet)}を受け取るには、会社は月に</div>
+              <div style={{ fontFamily: "'Shippori Mincho', serif", fontWeight: 800, fontSize: 34, margin: "4px 0" }}>{man(s.needPQ)}</div>
+              <div style={{ fontSize: 13, color: C.inkSoft }}>売り上げる必要があります</div>
+              <div style={{ display: "flex", justifyContent: "center", gap: 18, marginTop: 12, fontSize: 13 }}>
+                <span>額面の <b style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 18, color: C.shu }}>{s.xGross.toFixed(1)}倍</b></span>
+                <span>手取りの <b style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 18, color: C.shu }}>{s.xNet.toFixed(1)}倍</b></span>
+              </div>
+            </div>
+
+            <Card title="売上からあなたの口座まで" sub={`逆算された額面月給：${yen(s.gross)}（標準報酬月額 健保${man(s.pr.sh)}／厚年${man(s.pr.sp)}）`}>
+              <Flow rows={flowRows} total={s.needPQ} />
+            </Card>
+
+            <Card title="社会保険料の明細（月額）" sub="同じ保険に、あなたと会社が「両側から」払っています。">
+              <div style={{ display: "flex", fontSize: 11.5, fontWeight: 700, color: C.inkSoft, paddingBottom: 6, borderBottom: `1px solid ${C.line}` }}>
+                <span style={{ flex: 1 }}>項目</span>
+                <span style={{ width: 78, textAlign: "right" }}>本人負担</span>
+                <span style={{ width: 78, textAlign: "right" }}>会社負担</span>
+              </div>
+              {detail.map(([n, w, e], i) => (
+                <div key={i} style={{ display: "flex", fontSize: 12.5, padding: "7px 0", borderBottom: `1px dashed ${C.line}` }}>
+                  <span style={{ flex: 1, color: C.inkSoft }}>{n}</span>
+                  <span style={{ width: 78, textAlign: "right", fontFamily: "'IBM Plex Mono', monospace" }}>{w ? yen(w) : "—"}</span>
+                  <span style={{ width: 78, textAlign: "right", fontFamily: "'IBM Plex Mono', monospace" }}>{e ? yen(e) : "—"}</span>
+                </div>
+              ))}
+              <div style={{ display: "flex", fontSize: 13, fontWeight: 700, paddingTop: 8 }}>
+                <span style={{ flex: 1 }}>合計</span>
+                <span style={{ width: 78, textAlign: "right", fontFamily: "'IBM Plex Mono', monospace" }}>{yen(s.pr.wSocial)}</span>
+                <span style={{ width: 78, textAlign: "right", fontFamily: "'IBM Plex Mono', monospace" }}>{yen(s.pr.eSocial)}</span>
+              </div>
+              <div style={{ marginTop: 10, fontSize: 12.5, color: C.inkSoft, lineHeight: 1.8 }}>
+                所得税：月{yen(s.pr.itax)}（年間実負担の月割・復興特別所得税2.1%込）<br />
+                住民税：月{yen(s.pr.rtax)}（所得割10%＋均等割・森林環境税、調整控除反映）<br />
+                会社の人件費総額：月<b style={{ color: C.ink }}>{yen(s.laborCost)}</b>（額面の{((s.laborCost / s.gross - 1) * 100).toFixed(1)}%増）
+              </div>
+            </Card>
+
+            <p style={{ fontSize: 11, color: C.inkSoft, lineHeight: 1.8 }}>
+              【計算の前提】令和8年度（2026年度）料率・税制：協会けんぽ東京9.85%・介護1.62%・子ども・子育て支援金0.23%・厚生年金18.3%・雇用保険（一般の事業）本人0.5%／会社0.85%・労災0.3%・子ども・子育て拠出金0.36%。所得税は令和8年分の基礎控除（最大104万円）・給与所得控除で年間税額を月割（賞与なし・単身・扶養なし・その他控除なし）。住民税は基礎控除43万円・均等割5,000円（森林環境税込・東京23区目安）。源泉徴収票の月額とは端数処理・年末調整の関係でずれます。構造理解のための概算であり、個別判断は税理士・社労士にご確認ください。
+            </p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<MQVisualizer />);
+</script>
+</body>
+</html>
