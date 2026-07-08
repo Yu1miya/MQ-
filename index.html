@@ -542,10 +542,10 @@ function MQVisualizer() {
         {tab === "salary" && (
           <>
             <Card accent title="欲しい手取りから、必要な売上を逆算する。">
-              <Field label="手取" sub="欲しい手取り月額" value={targetNet} onChange={setTargetNet} min={150000} max={30000000} step={10000} unit="円" />
+              <Field label="手取" sub="欲しい手取り月額" value={targetNet} onChange={setTargetNet} min={150000} max={5000000} step={10000} unit="円" />
               <Field label="粗利" sub="粗利率" value={mRatePct} onChange={setMRatePct} min={10} max={100} step={1} unit="％" />
               <Field label="固定" sub="あなたの給与以外の固定費（月）" value={otherF2} onChange={setOtherF2} min={0} max={2000000} step={10000} unit="円" />
-              <Field label="利益" sub="会社に残したい利益G（月）" value={targetG} onChange={setTargetG} min={0} max={30000000} step={10000} unit="円" />
+              <Field label="利益" sub="会社に残したい利益G（月）" value={targetG} onChange={setTargetG} min={0} max={10000000} step={10000} unit="円" />
               <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginTop: 4 }}>
                 <input type="checkbox" checked={isCare} onChange={(e) => setIsCare(e.target.checked)} style={{ accentColor: C.ink, width: 16, height: 16 }} />
                 40〜64歳（介護保険料あり）
